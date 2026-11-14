@@ -11,6 +11,7 @@ import re
 import sys
 import tarfile
 import tempfile
+import unicodedata
 import urllib.error
 import urllib.request
 from collections import namedtuple
@@ -61,11 +62,49 @@ INDEX_JSON_FILENAME = "index.json"
 # not an error -- it just means no custom sources are added.
 SOURCES_CONFIG_FILE = Path(os.environ.get("DICT_BUILDER_SOURCES_FILE", "sources.json"))
 
+# --- Licensing / attribution ------------------------------------------------
+# Wiktionary-derived data is shared under CC BY-SA, so every output carries
+# attribution. The license is NOT taken from these constants at build time:
+# resolve_wiktionary_license() asks the source wiki's own API what license
+# it is currently published under, so a future license change on Wiktionary
+# is picked up without editing this script. The values below are only the
+# fallback for when that request fails (offline build) and for --example,
+# which deliberately never touches the network.
+WIKTIONARY_LICENSE = "CC BY-SA 4.0"
+WIKTIONARY_LICENSE_URL = "https://creativecommons.org/licenses/by-sa/4.0/"
+KAIKKI_URL = "https://kaikki.org"
+WIKTIONARY_URL = "https://en.wiktionary.org"
+WIKTIONARY_API_URL = (
+    WIKTIONARY_URL
+    + "/w/api.php?action=query&meta=siteinfo&siprop=rightsinfo&format=json&formatversion=2"
+)
+WIKTEXTRACT_CITATION = (
+    "Tatu Ylonen: Wiktextract: Wiktionary as Machine-Readable Structured "
+    "Data, Proceedings of the 13th Conference on Language Resources and "
+    "Evaluation (LREC), pp. 1317-1325, Marseille, 20-25 June 2022."
+)
+WIKTIONARY_ATTRIBUTION = (
+    "Word list data extracted from English Wiktionary via kaikki.org "
+    "(wiktextract by Tatu Ylonen)"
+)
+UNKNOWN_LICENSE = "unknown"
+
+# Result of resolve_wiktionary_license(); None until a build resolves it.
+_resolved_source_license: Optional[Tuple[str, str]] = None
+
 MIN_WORD_LENGTH = 1
 MAX_WORD_LENGTH = 45
-# Matches any run of letters in any script (no digits, no punctuation),
-# Unicode-aware via the \w negated class.
-UNIVERSAL_WORD_REGEX = re.compile(r"^[^\W\d_]+$", re.UNICODE)
+# Characters allowed BETWEEN letter runs inside one word: ASCII/typographic
+# apostrophes and hyphens ("don't", "l'homme", "e-mail", "по-русски"). They
+# are never allowed at the start/end or doubled. Spaces stay excluded: a
+# keyboard dictionary stores single tokens, not phrases.
+WORD_JOINERS = "'\u2019\u02bc-\u2010"
+
+# Fast path: letter runs (any script) optionally joined by WORD_JOINERS.
+# \w-based, so it cannot see combining marks (see _is_word_with_marks).
+UNIVERSAL_WORD_REGEX = re.compile(
+    r"^[^\W\d_]+(?:['\u2019\u02bc\-\u2010][^\W\d_]+)*$", re.UNICODE
+)
 
 # Network read size. Kept as a named constant so download loops and any future
 # tuning stay in sync instead of duplicating a magic number.
@@ -173,7 +212,87 @@ _GROUP_OVERRIDES = {
 # `folder` is only meaningful for kaikki entries (the href path segment on
 # the index page); custom entries use a synthetic "custom:<code>" folder
 # purely as a unique key for the TUI's selection dict.
-LangEntry = namedtuple("LangEntry", ["name", "folder", "senses", "source", "url"])
+LangEntry = namedtuple(
+    "LangEntry",
+    ["name", "folder", "senses", "source", "url", "license", "license_url"],
+    defaults=(None, None),  # license fields only exist for custom sources
+)
+
+
+# Languages the keyboard app can use, i.e. those it has a layout for.
+# Key: the language name exactly as Kaikki.org lists it. Value: the app's language
+# codes for it. The first code names the archive; any further code gets its own
+# index entry pointing at the same archive (Kaikki has one "Serbo-Croatian" for
+# what the app offers as Serbian and Croatian).
+# NOT checked against the live Kaikki list (no network when this was written):
+# "Serbo-Croatian" and "Norwegian Bokm\u00e5l" are the likely names, and any name here
+# that Kaikki does not list is reported before the menu opens.
+SUPPORTED_LANGUAGES: Dict[str, Tuple[str, ...]] = {
+    "Arabic": ("ar",), "Belarusian": ("be",), "Bulgarian": ("bg",), "Catalan": ("ca",),
+    "Czech": ("cs",), "Danish": ("da",), "German": ("de",), "Greek": ("el",),
+    "English": ("en",), "Spanish": ("es",), "Estonian": ("et",), "Finnish": ("fi",),
+    "French": ("fr",), "Hebrew": ("he",), "Hindi": ("hi",), "Hungarian": ("hu",),
+    "Indonesian": ("id",), "Italian": ("it",), "Japanese": ("ja",), "Korean": ("ko",),
+    "Latin": ("la",), "Lithuanian": ("lt",), "Malay": ("ms",), "Dutch": ("nl",),
+    "Norwegian Bokm\u00e5l": ("no",), "Polish": ("pl",), "Portuguese": ("pt",),
+    "Romanian": ("ro",), "Russian": ("ru",), "Slovak": ("sk",),
+    "Serbo-Croatian": ("sr", "hr"), "Swedish": ("sv",), "Turkish": ("tr",),
+    "Ukrainian": ("uk",),
+}
+
+# Display names for the extra (non-first) codes above.
+ALIAS_LANGUAGE_NAMES: Dict[str, str] = {"hr": "Croatian"}
+
+# True unless --all-languages is given.
+SUPPORTED_ONLY = True
+
+
+def supported_codes() -> Set[str]:
+    return {code for codes in SUPPORTED_LANGUAGES.values() for code in codes}
+
+
+def filter_supported(languages: List[LangEntry]) -> Tuple[List[LangEntry], List[str]]:
+    """Keep only languages the app supports.
+
+    Kaikki entries are matched by name, custom sources by their language code.
+    Returns (kept, supported names Kaikki did not list), so a renamed language is
+    noticed instead of silently disappearing from the menu.
+    """
+    codes = supported_codes()
+    kept: List[LangEntry] = []
+    for lang in languages:
+        if lang.source == "custom":
+            if lang.folder.split(":", 1)[-1] in codes:
+                kept.append(lang)
+        elif lang.name in SUPPORTED_LANGUAGES:
+            kept.append(lang)
+    listed = {l.name for l in languages if l.source == "kaikki"}
+    missing = sorted(name for name in SUPPORTED_LANGUAGES if name not in listed)
+    return kept, missing
+
+
+def with_alias_entries(built: Dict[str, dict]) -> Dict[str, dict]:
+    """Add an index entry for every extra app code of a built language."""
+    result = dict(built)
+    for lang_key, entry in built.items():
+        for extra_code in SUPPORTED_LANGUAGES.get(entry["lang_name"], ())[1:]:
+            alias_key = f"{lang_key}:{extra_code}"
+            result[alias_key] = {
+                **entry,
+                "lang_key": alias_key,
+                "lang_code": extra_code,
+                "lang_name": ALIAS_LANGUAGE_NAMES.get(extra_code, extra_code),
+            }
+    return result
+
+
+def show_notice(stdscr, lines: List[str]) -> None:
+    stdscr.clear()
+    for i, line in enumerate(lines):
+        stdscr.addstr(2 + i, 2, line)
+    stdscr.addstr(4 + len(lines), 2, "Press any key to continue...")
+    stdscr.refresh()
+    stdscr.getch()
 
 
 def fetch_dynamic_languages() -> List[LangEntry]:
@@ -188,7 +307,6 @@ def fetch_dynamic_languages() -> List[LangEntry]:
     """
     languages: List[LangEntry] = []
     fallback_languages = [
-        LangEntry("Russian", "Russian", 492474, "kaikki", None),
         LangEntry("English", "English", 1787236, "kaikki", None),
         LangEntry("German", "German", 633412, "kaikki", None),
         LangEntry("French", "French", 459894, "kaikki", None),
@@ -296,7 +414,10 @@ def load_custom_sources() -> List[LangEntry]:
         if not (name and code and url):
             logger.warning("Skipping malformed entry in %s: %r", SOURCES_CONFIG_FILE, item)
             continue
-        entries.append(LangEntry(name, f"custom:{code.lower()}", 0, "custom", url))
+        entries.append(LangEntry(
+            name, f"custom:{code.lower()}", 0, "custom", url,
+            item.get("license") or None, item.get("license_url") or None,
+        ))
 
     return entries
 
@@ -305,7 +426,35 @@ def is_valid_token(word: str) -> bool:
     """Validate token length and character set."""
     if not (MIN_WORD_LENGTH <= len(word) <= MAX_WORD_LENGTH):
         return False
-    return bool(UNIVERSAL_WORD_REGEX.match(word))
+    if UNIVERSAL_WORD_REGEX.match(word):
+        return True
+    if word.isascii():
+        return False
+    return _is_word_with_marks(word)
+
+
+def _is_word_with_marks(word: str) -> bool:
+    """Slow path for non-ASCII words the fast regex rejected. Python's \\w
+    does not count combining marks (Unicode categories M*) as word
+    characters, so words in Devanagari, Thai, Arabic with vowel marks, etc.
+    ("हिन्दी") failed the fast path even though they are ordinary words.
+    Here a word is accepted if it starts with a letter, contains only
+    letters/marks and single inner joiners, and ends on a letter or mark.
+    Only reached for words the regex already rejected, so the per-character
+    category lookups don't slow down the common case."""
+    if unicodedata.category(word[0])[0] != "L":
+        return False
+    prev_joiner = False
+    for ch in word:
+        if ch in WORD_JOINERS:
+            if prev_joiner:
+                return False
+            prev_joiner = True
+        elif unicodedata.category(ch)[0] in ("L", "M"):
+            prev_joiner = False
+        else:
+            return False
+    return not prev_joiner
 
 
 def detect_script(word: str) -> Optional[str]:
@@ -388,6 +537,7 @@ def save_manifest(output_dir: Path, entries: Dict[str, dict]) -> None:
     manifest_path = output_dir / INDEX_JSON_FILENAME
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        **manifest_attribution(),
         "languages": sorted(entries.values(), key=lambda e: e["lang_name"]),
     }
     manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -405,6 +555,299 @@ def is_cache_valid(entry: dict, output_dir: Path) -> bool:
         return compute_sha256(archive_path) == entry.get("sha256")
     except OSError:
         return False
+
+
+def _license_label_from_url(url: str) -> Optional[str]:
+    """Turn a Creative Commons license URL into a short label, e.g.
+    ".../licenses/by-sa/4.0/" -> "CC BY-SA 4.0". The wiki API's own `text`
+    field has no version number ("Creative Commons Attribution-ShareAlike
+    License"), and the version is exactly what matters, so it is read from
+    the URL. Returns None for non-CC URLs."""
+    match = re.search(r"creativecommons\.org/licenses/([a-z\-]+)/([\d.]+)", url)
+    if not match:
+        return None
+    return f"CC {match.group(1).upper()} {match.group(2)}"
+
+
+def resolve_wiktionary_license() -> Tuple[str, str]:
+    """Ask English Wiktionary which license its content is published under
+    (MediaWiki API, siprop=rightsinfo) and cache the answer for this run.
+
+    Why not hardcode it: the version is easy to get wrong (older material
+    and third-party repos still say 3.0, the site now says 4.0) and it can
+    change again. Any failure -- offline, timeout, unexpected response --
+    falls back to the built-in constants and is logged, never fatal.
+    """
+    global _resolved_source_license
+    label, url = WIKTIONARY_LICENSE, WIKTIONARY_LICENSE_URL
+    try:
+        # Wikimedia asks API clients for a descriptive User-Agent rather
+        # than a browser string, so this call identifies itself.
+        req = urllib.request.Request(
+            WIKTIONARY_API_URL,
+            headers={"User-Agent": "DictionaryBuilder/1.0 (keyboard word-list builder)"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            info = json.loads(response.read().decode("utf-8"))["query"]["rightsinfo"]
+        api_url = str(info.get("url") or "").strip()
+        if api_url.startswith("//"):  # the API may return a protocol-relative URL
+            api_url = "https:" + api_url
+        if api_url.startswith(("http://", "https://")):
+            url = api_url
+            label = _license_label_from_url(api_url) or str(info.get("text") or label)
+            logger.info("Wiktionary license from API: %s (%s)", label, url)
+        else:
+            logger.warning("Wiktionary API returned no usable license URL; using fallback %s", label)
+    except Exception as exc:
+        logger.warning("Could not fetch Wiktionary license (%s: %s); using fallback %s",
+                       type(exc).__name__, exc, label)
+    _resolved_source_license = (label, url)
+    return _resolved_source_license
+
+
+def current_wiktionary_license() -> Tuple[str, str]:
+    """(label, url) resolved for this run, or the built-in fallback if no
+    build has resolved it (e.g. --example). Never touches the network."""
+    return _resolved_source_license or (WIKTIONARY_LICENSE, WIKTIONARY_LICENSE_URL)
+
+
+def manifest_attribution() -> dict:
+    """Top-level attribution fields for index.json."""
+    label, url = current_wiktionary_license()
+    return {
+        "license": label,
+        "license_url": url,
+        "source": KAIKKI_URL,
+        "attribution": WIKTIONARY_ATTRIBUTION,
+        "citation": WIKTEXTRACT_CITATION,
+    }
+
+
+def license_fields(lang: Optional[LangEntry]) -> dict:
+    """Per-language license/attribution fields for an index.json entry.
+    Written on every entry (not only custom ones) because a catalog can mix
+    Wiktionary-derived and user-supplied languages, so the single top-level
+    license would be wrong for some entries."""
+    if lang is not None and lang.source == "custom":
+        fields = {
+            "license": lang.license or UNKNOWN_LICENSE,
+            "attribution": f"Data from {lang.url}",
+        }
+        if lang.license_url:  # only when the user actually gave one
+            fields["license_url"] = lang.license_url
+        return fields
+    label, url = current_wiktionary_license()
+    return {"license": label, "license_url": url, "attribution": WIKTIONARY_ATTRIBUTION}
+
+
+def license_changed(entry: dict, lang: LangEntry) -> bool:
+    """True if an otherwise-valid cached archive carries stale license text
+    in its ATTRIBUTION.txt and must be rebuilt. Custom sources are small
+    and cheap, so a missing license also triggers a rebuild for them.
+    Wiktionary-derived archives built before license tracking existed are
+    NOT rebuilt (that would mean re-downloading gigabytes); they just get
+    the fields backfilled in the manifest."""
+    expected = license_fields(lang)
+    if "license" not in entry:
+        return lang.source == "custom"
+    if lang.source == "custom":
+        return (entry["license"] != expected["license"]
+                or entry.get("license_url") != expected.get("license_url"))
+    return entry["license"] != expected["license"]
+
+
+def build_attribution_text(lang_name: str, built_at: str,
+                           lang: Optional[LangEntry], example: bool = False) -> str:
+    """Contents of ATTRIBUTION.txt, placed inside every archive so the
+    attribution travels with the data even when the archive is copied away
+    from index.json."""
+    if lang is not None and lang.source == "custom":
+        lic = lang.license
+        if not lic or lic.lower() == UNKNOWN_LICENSE:
+            lic = "Unknown - user-supplied source"
+        elif lang.license_url and lang.license_url != lic:
+            lic = f"{lic} ({lang.license_url})"
+        text = (f"{lang_name} word list\n\n"
+                f"Source: {lang.url}\n"
+                f"Built: {built_at}\n"
+                f"License: {lic}\n")
+    else:
+        label, url = current_wiktionary_license()
+        text = (f"{lang_name} word list\n\n"
+                f"Source: English Wiktionary ({WIKTIONARY_URL}), extracted\n"
+                "via kaikki.org (wiktextract by Tatu Ylonen).\n"
+                f"Built: {built_at}\n"
+                f"License: {label} ({url})\n\n"
+                "This word list is a derivative work of Wiktionary content and is\n"
+                "distributed under the same license. The full list of authors of\n"
+                "each Wiktionary entry is available in the edit history of the\n"
+                "corresponding page.\n\n"
+                "Citation: Tatu Ylonen: Wiktextract: Wiktionary as Machine-Readable\n"
+                "Structured Data, Proceedings of LREC 2022, pp. 1317-1325.\n")
+    if example:
+        text += "\nNOTE: this is an EXAMPLE archive with made-up sample words, not real data.\n"
+    return text
+
+
+def save_custom_license(lang: LangEntry, license_text: str) -> LangEntry:
+    """Persist a license for a custom source into sources.json and return
+    the updated entry. If the text is a URL it is also stored as
+    license_url; otherwise any stale license_url is dropped. Written via a
+    temp file + rename so a crash can never leave a half-written config.
+    Raises ValueError if the source is no longer in the file."""
+    raw = json.loads(SOURCES_CONFIG_FILE.read_text(encoding="utf-8"))
+    is_url = license_text.lower().startswith(("http://", "https://"))
+    for item in raw.get("custom_languages", []):
+        if item.get("lang_name") == lang.name and item.get("url") == lang.url:
+            item["license"] = license_text
+            if is_url:
+                item["license_url"] = license_text
+            else:
+                item.pop("license_url", None)
+            break
+    else:
+        raise ValueError(f"{lang.name} not found in {SOURCES_CONFIG_FILE}")
+
+    tmp_path = SOURCES_CONFIG_FILE.with_name(SOURCES_CONFIG_FILE.name + ".tmp")
+    tmp_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_path, SOURCES_CONFIG_FILE)
+    return lang._replace(license=license_text, license_url=license_text if is_url else None)
+
+
+def prompt_license(stdscr, lang: LangEntry) -> str:
+    """Text-entry screen asking for a custom source's license. Returns the
+    stripped input; empty string means "leave unknown"."""
+    curses.echo()
+    curses.curs_set(1)
+    try:
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+        stdscr.addstr(2, 2, f"Custom source: {lang.name} ({lang.url})"[:width - 4])
+        stdscr.addstr(4, 2, "What license does this word list use?")
+        stdscr.addstr(5, 2, '(e.g. "CC0", "MIT", "public domain", or a URL to the license)')
+        stdscr.addstr(6, 2, "Leave empty to mark it as UNKNOWN.")
+        stdscr.addstr(8, 2, "License: ")
+        stdscr.refresh()
+        raw = stdscr.getstr(8, 11, max(1, min(200, width - 13)))
+        return raw.decode("utf-8", errors="ignore").strip()
+    except curses.error:
+        return ""
+    finally:
+        curses.noecho()
+        curses.curs_set(0)
+
+
+def confirm_unknown_license(stdscr, name: str) -> bool:
+    """Warn that a custom source has no license and ask to continue anyway.
+    True only on an explicit Y; N or Esc cancels."""
+    stdscr.clear()
+    height, width = stdscr.getmaxyx()
+    lines = [
+        f'No license specified for "{name}".',
+        "",
+        'The word list will be marked as "license: unknown" in',
+        "index.json. You are responsible for verifying that you have",
+        "the right to redistribute this data. Continue?",
+        "",
+        "[Y] Yes, continue    [N] Cancel",
+    ]
+    for i, text in enumerate(lines):
+        stdscr.addstr(2 + i, 2, text[:max(1, width - 4)])
+    stdscr.refresh()
+    while True:
+        key = stdscr.getch()
+        if key in (ord('y'), ord('Y')):
+            return True
+        if key in (ord('n'), ord('N'), 27):
+            return False
+
+
+def edit_custom_license(stdscr, lang: LangEntry) -> LangEntry:
+    """Ask for a license, confirm if left empty, save it. Returns the
+    (possibly unchanged) entry; any failure is shown and logged, not raised."""
+    text = prompt_license(stdscr, lang)
+    if not text:
+        if not confirm_unknown_license(stdscr, lang.name):
+            return lang
+        text = UNKNOWN_LICENSE
+    try:
+        updated = save_custom_license(lang, text)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Could not save license for %s: %s: %s", lang.name, type(exc).__name__, exc)
+        stdscr.clear()
+        stdscr.addstr(2, 2, "Could not save the license to sources.json (see debug log).")
+        stdscr.addstr(4, 2, "Press any key...")
+        stdscr.refresh()
+        stdscr.getch()
+        return lang
+    logger.info("License set for custom source %s: %s", lang.name, text)
+    return updated
+
+
+def run_license_menu(stdscr, languages: List[LangEntry]) -> None:
+    """[L] screen: list the custom sources and set each one's license.
+    Replaces entries in `languages` in place so the main picker and the
+    build see the new values immediately."""
+    custom_idx = [i for i, lang in enumerate(languages) if lang.source == "custom"]
+    if not custom_idx:
+        stdscr.clear()
+        stdscr.addstr(2, 2, f"No custom sources found in {SOURCES_CONFIG_FILE}.")
+        stdscr.addstr(4, 2, "Press any key to go back...")
+        stdscr.refresh()
+        stdscr.getch()
+        return
+
+    current = 0
+    while True:
+        stdscr.clear()
+        height, width = stdscr.getmaxyx()
+        stdscr.addstr(0, 2, " CUSTOM SOURCE LICENSES ", curses.A_REVERSE)
+        stdscr.addstr(1, 2, "[Up/Down] Navigate | [Enter] Set license | [Q] Back"[:max(1, width - 3)])
+        for row, idx in enumerate(custom_idx):
+            y_pos = 3 + row
+            if y_pos >= height - 1:
+                break
+            lang = languages[idx]
+            line = f" {lang.name} ({lang.url})  license: {lang.license or 'not set'}"
+            attr = curses.A_STANDOUT if row == current else curses.A_NORMAL
+            stdscr.addstr(y_pos, 2, line[:max(1, width - 4)], attr)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (curses.KEY_UP, ord('k')):
+            current = (current - 1) % len(custom_idx)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            current = (current + 1) % len(custom_idx)
+        elif key in (10, 13):
+            idx = custom_idx[current]
+            languages[idx] = edit_custom_license(stdscr, languages[idx])
+        elif key in (ord('q'), ord('Q'), 27):
+            return
+
+
+def resolve_unlicensed_custom(stdscr, chosen: List[LangEntry]) -> Tuple[List[LangEntry], int]:
+    """Before building, make sure every chosen custom source either has a
+    license or an explicit "unknown" acknowledgement. Answering N skips that
+    source for this run (nothing else is blocked). Acknowledgements are
+    saved to sources.json so the question is not asked again. Returns
+    (sources to build, number skipped)."""
+    kept: List[LangEntry] = []
+    skipped = 0
+    for lang in chosen:
+        if lang.source != "custom" or lang.license is not None:
+            kept.append(lang)
+            continue
+        if not confirm_unknown_license(stdscr, lang.name):
+            logger.warning("Skipping custom source %s: no license and not confirmed", lang.name)
+            skipped += 1
+            continue
+        try:
+            lang = save_custom_license(lang, UNKNOWN_LICENSE)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning("Could not persist 'unknown' license for %s: %s", lang.name, exc)
+            lang = lang._replace(license=UNKNOWN_LICENSE)
+        kept.append(lang)
+    return kept, skipped
 
 
 def prompt_for_output_dir(stdscr) -> Optional[Path]:
@@ -469,7 +912,7 @@ def run_interactive_menu(
         title = " DYNAMIC LANGUAGE SELECTION FOR DICTIONARY BUILD "
         stdscr.addstr(0, max(0, (width - len(title)) // 2), title, curses.A_REVERSE)
 
-        help_text = "[Space] Toggle|[A] All|[C] Clear|[F] Rebuild|[D] Output dir|[Enter] Build|[Q] Quit"
+        help_text = "[Spc] Toggle [A]ll [C]lear [F]orce [D]ir [L]icenses [Enter] Build [Q]uit"
         stdscr.addstr(1, max(0, (width - len(help_text)) // 2), help_text[:width - 1], curses.A_BOLD)
         rebuild_label = f" Force full rebuild (ignore cache): {'ON' if force_rebuild else 'OFF'} "
         stdscr.addstr(2, max(0, (width - len(rebuild_label)) // 2), rebuild_label,
@@ -487,7 +930,7 @@ def run_interactive_menu(
             lang = languages[idx]
             checkbox = "[x]" if selected[lang.folder] else "[ ]"
             if lang.source == "custom":
-                status = "(custom source)"
+                status = f"(custom source, license: {lang.license or 'not set'})"
             else:
                 status = f"(senses: {lang.senses:,})"
             cached_tag = " [cached]" if lang.name.lower() in cached_keys else ""
@@ -521,6 +964,8 @@ def run_interactive_menu(
                 selected[lang.folder] = False
         elif key in (ord('f'), ord('F')):
             force_rebuild = not force_rebuild
+        elif key in (ord('l'), ord('L')):
+            run_license_menu(stdscr, languages)
         elif key in (ord('d'), ord('D')):
             new_dir = prompt_for_output_dir(stdscr)
             if new_dir is not None:
@@ -761,7 +1206,8 @@ def process_custom_source(
 
 
 def assemble_and_pack(
-    stdscr, temp_dir: Path, lang_codes: Dict[str, str]
+    stdscr, temp_dir: Path, lang_codes: Dict[str, str],
+    lang_entries: Dict[str, LangEntry], built_at: str,
 ) -> Dict[str, Tuple[Path, int]]:
     """Case-insensitive, diacritic-aware sort; one archive per language.
 
@@ -814,6 +1260,17 @@ def assemble_and_pack(
         # around (potentially millions of strings for a large language)
         # only cost memory and archive size without being used.
 
+        # ATTRIBUTION.txt travels inside the archive so the license notice
+        # survives even if the archive is copied away from index.json.
+        # built_at is passed in (one timestamp per build) so this file and
+        # the manifest entry always agree on the build time.
+        lang_entry = lang_entries.get(lang_key)
+        (final_lang_dir / "ATTRIBUTION.txt").write_text(
+            build_attribution_text(lang_entry.name if lang_entry else lang_key,
+                                   built_at, lang_entry),
+            encoding="utf-8",
+        )
+
         progress_callback(stdscr, "Packing archive", idx, total_langs,
                           f"Creating {lang_code.upper()}-kaikki.tar.gz")
         archive_path = OUTPUT_DIR / f"{lang_code.upper()}-kaikki.tar.gz"
@@ -829,7 +1286,6 @@ def _sort_key(word: str):
     as a tiebreaker for determinism. NFKD-normalizes and strips combining
     marks so accented variants interleave with their base letters the way a
     reader expects (e.g. e / e-with-diaeresis)."""
-    import unicodedata
     stripped = "".join(
         ch for ch in unicodedata.normalize("NFKD", word)
         if not unicodedata.combining(ch)
@@ -838,7 +1294,7 @@ def _sort_key(word: str):
 
 
 EXAMPLE_LANGUAGES: List[Tuple[str, str, List[str]]] = [
-    ("Russian", "ru", ["привет", "собака", "книга", "дом", "солнце", "вода", "хлеб"]),
+    ("Polish", "pl", ["cześć", "pies", "książka", "dom", "słońce", "woda", "chleb"]),
     ("English", "en", ["hello", "dog", "book", "house", "sun", "water", "bread"]),
 ]
 
@@ -857,6 +1313,7 @@ def generate_example_output(example_dir: Path) -> None:
     example_dir.mkdir(parents=True, exist_ok=True)
     manifest_entries: Dict[str, dict] = {}
     all_names_lower = {name.lower() for name, _, _ in EXAMPLE_LANGUAGES}
+    built_at = datetime.now(timezone.utc).isoformat()
 
     with tempfile.TemporaryDirectory() as temp_dir_str:
         temp_dir = Path(temp_dir_str)
@@ -875,6 +1332,11 @@ def generate_example_output(example_dir: Path) -> None:
                     "\n".join(sorted(letter_words, key=_sort_key)) + "\n", encoding="utf-8"
                 )
 
+            (lang_dir / "ATTRIBUTION.txt").write_text(
+                build_attribution_text(lang_name, built_at, None, example=True),
+                encoding="utf-8",
+            )
+
             archive_path = example_dir / f"{lang_code.upper()}-kaikki.tar.gz"
             with tarfile.open(archive_path, "w:gz") as tar:
                 tar.add(lang_dir, arcname=lang_key)
@@ -888,7 +1350,8 @@ def generate_example_output(example_dir: Path) -> None:
                 "word_count": len(words),
                 "weight": archive_path.stat().st_size,
                 "sha256": compute_sha256(archive_path),
-                "built_at": datetime.now(timezone.utc).isoformat(),
+                "built_at": built_at,
+                **license_fields(None),
                 "example": True,
             }
 
@@ -898,6 +1361,7 @@ def generate_example_output(example_dir: Path) -> None:
         "note": ("Sample output showing the real index.json/archive structure "
                 "with a handful of made-up words. NOT a real dictionary "
                 "catalog -- run without --example to build one."),
+        **manifest_attribution(),
         "languages": sorted(manifest_entries.values(), key=lambda e: e["lang_name"]),
     }
     (example_dir / INDEX_JSON_FILENAME).write_text(
@@ -918,6 +1382,13 @@ def main(stdscr) -> None:
     progress_callback(stdscr, "Initialization", 0, 100,
                       "Fetching dynamic language list from Kaikki.org...")
     languages = fetch_dynamic_languages() + load_custom_sources()
+    if SUPPORTED_ONLY:
+        languages, missing_supported = filter_supported(languages)
+        if missing_supported:
+            logger.warning("Supported languages not listed by Kaikki: %s", ", ".join(missing_supported))
+            show_notice(stdscr, ["Supported by the app but not found on Kaikki.org:"]
+                        + [f"  {name}" for name in missing_supported]
+                        + ["Check the names in SUPPORTED_LANGUAGES."])
     all_names_lower = {lang.name.lower() for lang in languages}
 
     # Step 2: interactive selection menu. OUTPUT_DIR may be changed here via
@@ -933,13 +1404,27 @@ def main(stdscr) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest(OUTPUT_DIR)
 
+    # Licensing: ask the source wiki which license it uses (falls back to the
+    # built-in value offline), and make sure every chosen custom source has a
+    # license or an explicit "unknown" acknowledgement before anything builds.
+    resolve_wiktionary_license()
+    chosen_langs, skipped_unlicensed = resolve_unlicensed_custom(stdscr, chosen_langs)
+    if not chosen_langs:
+        stdscr.clear()
+        stdscr.addstr(2, 2, "Nothing to build: all selected custom sources were skipped.")
+        stdscr.addstr(4, 2, "Press any key to exit...")
+        stdscr.refresh()
+        stdscr.getch()
+        return
+
     try:
         to_build: List[LangEntry] = []
         reused_count = 0
         for lang in chosen_langs:
             lang_key = lang.name.lower()
             entry = manifest.get(lang_key)
-            if not force_rebuild and entry and is_cache_valid(entry, OUTPUT_DIR):
+            if (not force_rebuild and entry and is_cache_valid(entry, OUTPUT_DIR)
+                    and not license_changed(entry, lang)):
                 # Backfill fields added in later versions of this script
                 # (group, weight) onto older manifest entries that predate
                 # them, so the schema stays consistent without forcing a
@@ -951,6 +1436,10 @@ def main(stdscr) -> None:
                 if "weight" not in entry:
                     entry["weight"] = (OUTPUT_DIR / entry["archive"]).stat().st_size
                     changed = True
+                for field_name, field_value in license_fields(lang).items():
+                    if field_name not in entry:
+                        entry[field_name] = field_value
+                        changed = True
                 if changed:
                     manifest[lang_key] = entry
                 reused_count += 1
@@ -974,6 +1463,13 @@ def main(stdscr) -> None:
                     lang_codes.update(
                         process_dumps_with_progress(stdscr, kaikki_langs, temp_dir)
                     )
+                    if SUPPORTED_ONLY:
+                        # The archive and index use the app's code, not the dump's
+                        # (the dump says "nb", the app says "no").
+                        for l in kaikki_langs:
+                            app_codes = SUPPORTED_LANGUAGES.get(l.name)
+                            if app_codes and l.name.lower() in lang_codes:
+                                lang_codes[l.name.lower()] = app_codes[0]
 
                 # Step 3b: custom word-list sources are fetched individually
                 # -- they aren't part of the combined dump.
@@ -985,13 +1481,18 @@ def main(stdscr) -> None:
                     raise RuntimeError("No data found for the selected languages.")
 
                 # Step 4: assembly, sorting and per-language archiving
-                pack_results = assemble_and_pack(stdscr, temp_dir, lang_codes)
+                built_at = datetime.now(timezone.utc).isoformat()
+                pack_results = assemble_and_pack(
+                    stdscr, temp_dir, lang_codes,
+                    {l.name.lower(): l for l in to_build}, built_at,
+                )
 
             # Step 5: checksum + manifest entries for what was just built.
             # Done after the TemporaryDirectory closes, since only the final
             # archives (written to OUTPUT_DIR, not temp_dir) need to survive.
             for lang_key, (archive_path, word_count) in pack_results.items():
-                lang_name = next((l.name for l in to_build if l.name.lower() == lang_key), lang_key)
+                lang_entry = next((l for l in to_build if l.name.lower() == lang_key), None)
+                lang_name = lang_entry.name if lang_entry else lang_key
                 built_this_run[lang_key] = {
                     "lang_key": lang_key,
                     "lang_name": lang_name,
@@ -1001,14 +1502,18 @@ def main(stdscr) -> None:
                     "word_count": word_count,
                     "weight": archive_path.stat().st_size,
                     "sha256": compute_sha256(archive_path),
-                    "built_at": datetime.now(timezone.utc).isoformat(),
+                    "built_at": built_at,
+                    **license_fields(lang_entry),
                 }
+                logger.info("License for %s: %s", lang_name, built_this_run[lang_key]["license"])
 
         # Merge: keep every previously known language untouched except the
         # ones processed this run (newly built, or already valid and thus
         # unchanged). Languages built in earlier runs but not selected this
         # time stay in the catalog -- this manifest is a persistent
         # server-side index, not a snapshot of "this run only".
+        if SUPPORTED_ONLY:
+            built_this_run = with_alias_entries(built_this_run)
         full_manifest = {**manifest, **built_this_run}
         save_manifest(OUTPUT_DIR, full_manifest)
 
@@ -1017,7 +1522,9 @@ def main(stdscr) -> None:
         line = 4
         stdscr.addstr(line, 2, f"Newly built: {len(built_this_run)}  |  "
                                 f"Reused from cache: {reused_count}  |  "
-                                f"Total in catalog: {len(full_manifest)}")
+                                f"Total in catalog: {len(full_manifest)}"
+                                + (f"  |  Skipped (no license confirmation): {skipped_unlicensed}"
+                                   if skipped_unlicensed else ""))
         line += 2
         for lang_key, entry in list(built_this_run.items())[:max(1, (curses.LINES if hasattr(curses, 'LINES') else 20) - line - 3)]:
             stdscr.addstr(line, 2, f"  {entry['archive']}  ({entry['word_count']:,} words)")
@@ -1055,7 +1562,14 @@ if __name__ == "__main__":
              "showing the real output structure -- no network access, no real "
              "build. Written to OUTPUT_DIR/example/, never touches a real catalog."
     )
+    parser.add_argument(
+        "--all-languages", action="store_true",
+        help="List every Kaikki language and custom source, not only the ones the "
+             "keyboard app supports.",
+    )
     args = parser.parse_args()
+    if args.all_languages:
+        SUPPORTED_ONLY = False
 
     if args.output_dir:
         OUTPUT_DIR = Path(args.output_dir).expanduser().resolve()
